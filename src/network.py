@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Union, List
-import torchvision
+import torchvision #type: ignore
 
 
 def conv3x3(in_channels: int, out_channels: int, stride: int = 1) -> nn.Module:

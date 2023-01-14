@@ -11,13 +11,13 @@ from typing import Union
 
 import argparse
 
-from network import AllCNN, resnet18
+from network import AllCNN
 
 device: Union[int, str] = 0 if torch.cuda.is_available() else "cpu"
 
 
 def model_pipeline(hyperparameters):
-    print(hyperparameters)
+    print("hyperparameters: ", hyperparameters)
 
     # wandbを開始する設定(configには辞書型で渡すこと)
     with wandb.init(project="pytorch-demo", config=hyperparameters):
@@ -72,8 +72,12 @@ def make(config):
     )
 
     # Modelを作成
-    # model = AllCNN().to(device)
-    model = resnet18().to(device)
+    if config.model == "AllCNN":
+        model = AllCNN()
+    else:
+        model = torchvision.models.resnet18()
+        model.fc = nn.Linear(in_features=512, out_features=10, bias=True)
+    model = model.to(device)
 
     # torchinfo.summary(model, input_size=(config.batch_size, 3, 32, 32))
 
@@ -163,6 +167,7 @@ def main():
     parser.add_argument("-e", "--epochs", type=int, default=140)
     parser.add_argument("--weight_decay", type=float, default=0.001)
     parser.add_argument("--lr_decay", type=float, default=0.97)
+    parser.add_argument("--model", type=str, default="ResNet18")
 
     args = parser.parse_args()
 
@@ -173,6 +178,7 @@ def main():
             "epochs": args.epochs,
             "weight_decay": args.weight_decay,
             "lr_decay": args.lr_decay,
+            "model": args.model,
         }
     )
 

@@ -14,6 +14,8 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 
+from network import AllCNN
+
 PROJECT_NAME = "critical"
 device: Union[int, str] = 0 if torch.cuda.is_available() else "cpu"
 
@@ -47,6 +49,7 @@ def model_pipeline(hyperparameters):
 def make(config):
 
     transform = transforms.ToTensor()
+
     # Dataset, Dataloaderを作成
     train_dataset = torchvision.datasets.CIFAR10(
         root=".data", train=True, download=True, transform=transform
@@ -62,8 +65,11 @@ def make(config):
     )
 
     # Modelを作成
-    model = torchvision.models.resnet18()
-    model.fc = nn.Linear(in_features=512, out_features=10, bias=True)
+    if config.model == "AllCNN":
+        model = AllCNN()
+    else:
+        model = torchvision.models.resnet18()
+        model.fc = nn.Linear(in_features=512, out_features=10, bias=True)
     model = model.to(device)
 
     # torchinfo.summary(model, input_size=(config.batch_size, 3, 32, 32))
@@ -138,5 +144,6 @@ if __name__ == "__main__":
             "epochs": 10,
             "weight_decay": 0.0005,
             "lr_decay": 0.97,
+            "model": "ResNet18",
         }
     )
