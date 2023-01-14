@@ -1,0 +1,19 @@
+#!/bin/sh
+#PJM -L rscgrp=share
+#PJM -L gpu=1
+#PJM -L elapse=2:00:00
+#PJM -o /work/gu14/k36093/critical/res.txt
+#PJM -g gu14
+#PJM -j
+#PJM --fs /work
+#PJM -m b,s
+#PJM --mail-list sakurai-jinya725@g.ecc.u-tokyo.ac.jp
+#PJM -N demo
+
+module load cuda/11.1
+module load pytorch/1.8.1
+
+
+wandb login f1a9a859505bece805152bcd9bcb82def6b657b8
+
+/work/gu14/k36093/.pyenv/versions/3.8.0/envs/hello_world/bin/python /work/gu14/k36093/critical/src/train.py -lr 0.1 --lr_decay 0.97 --weight_decay 0.0005

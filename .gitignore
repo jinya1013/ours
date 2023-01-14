@@ -1,0 +1,12 @@
+model.onnx
+requirement.txt
+res.txt
+run.sh
+wandb
+data
+src/__pycache__
+.python-version
+.data
+.mypy_cache
+.vscode
+
