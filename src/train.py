@@ -7,9 +7,10 @@ from torchvision.transforms.functional import to_pil_image, to_tensor  # type: i
 from torchmetrics.classification import MulticlassAccuracy
 import wandb
 from tqdm import tqdm
-from typing import Union
+from typing import Union, Dict, Tuple, Any
 
 import argparse
+from pprint import pprint
 
 from network import AllCNN
 
@@ -52,11 +53,20 @@ def model_pipeline(hyperparameters):
     return model
 
 
-def make(config):
+def make(
+    config,
+) -> Tuple[
+    nn.Module,
+    torch.utils.data.DataLoader,
+    torch.utils.data.DataLoader,
+    nn.CrossEntropyLoss,
+    MulticlassAccuracy,
+    optim.SGD,
+    optim.lr_scheduler.ExponentialLR,
+]:
 
-    transform = transforms.Compose(
-        [transforms.ToTensor(), transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    )
+    transform = transforms.ToTensor()
+
     # Dataset, Dataloaderを作成
     train_dataset = torchvision.datasets.CIFAR10(
         root=".data", train=True, download=True, transform=transform
@@ -84,7 +94,9 @@ def make(config):
     # lossとoptimizerを設定
     criterion = nn.CrossEntropyLoss()
     metrics = MulticlassAccuracy(num_classes=10).to(device)
-    optimizer = optim.SGD(model.parameters(), lr=config.learning_rate)
+    optimizer = optim.SGD(
+        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
+    )
     scheduler = optim.lr_scheduler.ExponentialLR(optimizer, config.lr_decay)
 
     return model, train_loader, test_loader, criterion, metrics, optimizer, scheduler
@@ -98,14 +110,28 @@ def run(
     wandb.watch(model, criterion, log="all", log_freq=10)
 
     for epoch in tqdm(range(config.epochs)):
-        train_loss = train_epoch(model, train_loader, criterion, optimizer, config)
+        train_loss, train_accuracy = train_epoch(
+            model, train_loader, criterion, metrics, optimizer, config
+        )
         test_loss, test_accuracy = test(model, test_loader, criterion, metrics)
-        take_log(train_loss, test_loss, test_accuracy, epoch)
+        take_log(
+            {
+                "train_loss": train_loss,
+                "test_loss": test_loss,
+                "train_accuracy": train_accuracy,
+                "test_accuracy": test_accuracy,
+                "epoch": epoch,
+            }
+        )
         scheduler.step()
 
 
-def train_epoch(model, train_loader, criterion, optimizer, config, down_sampled=False):
+def train_epoch(
+    model, train_loader, criterion, metrics, optimizer, config, down_sampled=False
+):
     train_loss = 0
+    train_accuracy = 0
+    num_data = 0
     model.train()
     for step, (images, labels) in enumerate(train_loader):
         if down_sampled:
@@ -119,8 +145,11 @@ def train_epoch(model, train_loader, criterion, optimizer, config, down_sampled=
         loss.backward()
         optimizer.step()
         train_loss += loss.item()
+        train_accuracy += metrics(outputs, labels).item() * len(labels)
+        num_data += len(labels)
     train_loss = train_loss / len(train_loader)
-    return train_loss
+    train_accuracy = train_accuracy / num_data
+    return train_loss, train_accuracy
 
 
 def test(model, test_loader, criterion, metrics):
@@ -134,7 +163,7 @@ def test(model, test_loader, criterion, metrics):
             outputs = model(images)
             loss = criterion(outputs, labels)
             test_loss += loss.item()
-            accuracy += metrics(outputs, labels) * len(labels)
+            accuracy += metrics(outputs, labels).item() * len(labels)
             num_data += len(labels)
         test_loss = test_loss / len(test_loader)
         test_accuracy = accuracy / num_data
@@ -145,18 +174,9 @@ def test(model, test_loader, criterion, metrics):
     return test_loss, test_accuracy
 
 
-def take_log(train_loss, test_loss, test_accuracy, epoch):
-    wandb.log(
-        {
-            "epoch": epoch,
-            "train_loss": train_loss,
-            "test_loss": test_loss,
-            "test_accuracy": test_accuracy,
-        }
-    )
-    print(
-        f"train_loss: {train_loss:.5f}, test_loss : {test_loss:.5f}, test_accuracy : {test_accuracy:.5f}"
-    )
+def take_log(info_dict):
+    wandb.log(info_dict)
+    pprint(info_dict)
 
 
 def main():
