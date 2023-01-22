@@ -24,9 +24,11 @@ class AllCNN(nn.Module):
         in_channels: int = 3,
         channels1: int = 96,
         channels2: int = 192,
+        num_classes: int = 10,
         stride: int = 1,
     ) -> None:
         super().__init__()
+        self.num_classes = 1 if num_classes == 2 else num_classes
 
         self.conv1: nn.Module = nn.Sequential(
             conv3x3(in_channels, channels1),
@@ -59,7 +61,7 @@ class AllCNN(nn.Module):
             conv1x1(channels2, channels2),
             nn.BatchNorm2d(channels2),
             nn.ReLU(inplace=True),
-            conv1x1(channels2, 10),
+            conv1x1(channels2, self.num_classes),
             nn.AdaptiveAvgPool2d(1),
         )
 
@@ -68,6 +70,8 @@ class AllCNN(nn.Module):
         out = self.conv2(out)
         out = self.conv3(out)
         out = out.squeeze()
+        if self.num_classes == 1:
+            return torch.sigmoid(out)
         return out
 
 
@@ -123,6 +127,7 @@ class ResNet(nn.Module):
     def __init__(self, block, num_blocks, num_classes=10):
         super(ResNet, self).__init__()
         self.in_planes = 64
+        self.num_classes = 1 if num_classes == 2 else num_classes
 
         self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(64)
@@ -130,7 +135,7 @@ class ResNet(nn.Module):
         self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
         self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
         self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.linear = nn.Linear(512 * block.expansion, num_classes)
+        self.linear = nn.Linear(512 * block.expansion, self.num_classes)
 
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1] * (num_blocks - 1)
@@ -149,6 +154,8 @@ class ResNet(nn.Module):
         out = F.avg_pool2d(out, 4)
         out = out.view(out.size(0), -1)
         out = self.linear(out)
+        if self.num_classes == 1:
+            return torch.sigmoid(out)
         return out
 
 

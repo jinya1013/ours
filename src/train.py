@@ -9,14 +9,12 @@ import wandb
 from tqdm import tqdm
 from typing import Union, Dict, Tuple, Any
 
-from PIL import Image
-
 import argparse
 from pprint import pprint
 
 from network import AllCNN, ResNet18
 from utils import imshow
-from dataset import Cifar10
+from dataset import CIFAR10, DogAircraftCIFAR10, DogDeerCIFAR10
 
 device: Union[int, str] = 0 if torch.cuda.is_available() else "cpu"
 
@@ -25,7 +23,11 @@ def model_pipeline(hyperparameters):
     print("hyperparameters: ", hyperparameters)
 
     # wandbを開始する設定(configには辞書型で渡すこと)
-    with wandb.init(project="critical", config=hyperparameters):
+    with wandb.init(
+        project=hyperparameters["project"],
+        name=f"critical_period:{hyperparameters['deficit_removal']}",
+        config=hyperparameters,
+    ):
 
         # wandb.configを通して, wandbのHPとアクセス
         config = wandb.config
@@ -57,27 +59,31 @@ def model_pipeline(hyperparameters):
 
 def make(
     config,
-) -> Tuple[
-    nn.Module,
-    torch.utils.data.DataLoader,
-    torch.utils.data.DataLoader,
-    nn.CrossEntropyLoss,
-    optim.SGD,
-    optim.lr_scheduler.ExponentialLR,
-]:
-
-    transform_train = transforms.Compose(
-        [
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
-        ]
-    )
-
-    transform_train_down_sample = transforms.Compose(
-        [transforms.Resize((8, 8)), transforms.Resize((32, 32)), transform_train]
-    )
+):
+    transform_train = {
+        "original": transforms.Compose(
+            [
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
+                ),
+            ]
+        ),
+        "subsample": transforms.Compose(
+            [
+                transforms.Resize((8, 8)),
+                transforms.Resize((32, 32)),
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    (0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)
+                ),
+            ]
+        ),
+    }
 
     transform_test = transforms.Compose(
         [
@@ -87,24 +93,28 @@ def make(
     )
 
     # Dataset, Dataloaderを作成
-    if config.aug:
-        train_dataset = Cifar10(
+    if config.num_classes == 2:
+        train_dataset = DogDeerCIFAR10(
             root=".data",
             train=True,
             download=True,
-            transform=[transform_train, transform_train_down_sample],
+            transform=transform_train,
+        )
+        test_dataset = DogDeerCIFAR10(
+            root="./data", train=False, download=True, transform=transform_test
         )
     else:
-        train_dataset = Cifar10(
+        train_dataset = CIFAR10(
             root=".data",
             train=True,
             download=True,
-            transform=[transform_train, transform_train_down_sample],
+            transform=transform_train,
+            deficit=config.deficit,
+        )
+        test_dataset = CIFAR10(
+            root="./data", train=False, download=True, transform=transform_test
         )
 
-    test_dataset = Cifar10(
-        root="./data", train=False, download=True, transform=transform_test
-    )
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=2
     )
@@ -114,15 +124,15 @@ def make(
 
     # Modelを作成
     if config.model == "AllCNN":
-        model = AllCNN()
+        model = AllCNN(num_classes=config.num_classes)
     else:
-        model = ResNet18()
+        model = ResNet18(num_classes=config.num_classes)
     model = model.to(device)
 
     # torchinfo.summary(model, input_size=(config.batch_size, 3, 32, 32))
 
     # lossとoptimizerを設定
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCELoss() if config.num_classes == 2 else nn.CrossEntropyLoss()
     optimizer = optim.SGD(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
@@ -136,9 +146,17 @@ def run(model, train_loader, test_loader, criterion, optimizer, scheduler, confi
     # 任意 : log_freqステップの学習ごとにパラメータの勾配とモデルのパラメータを記録
     wandb.watch(model, criterion, log="all", log_freq=10)
 
+    train_critical(
+        model, train_loader, test_loader, criterion, optimizer, scheduler, config
+    )
+
+    train(model, train_loader, test_loader, criterion, optimizer, scheduler, config)
+
+
+def train(model, train_loader, test_loader, criterion, optimizer, scheduler, config):
     for epoch in tqdm(range(config.epochs)):
         train_loss, train_accuracy = train_epoch(
-            model, train_loader, criterion, optimizer, config
+            model, train_loader, criterion, optimizer, down_sampled=False
         )
         test_loss, test_accuracy = test(model, test_loader, criterion)
         take_log(
@@ -153,7 +171,27 @@ def run(model, train_loader, test_loader, criterion, optimizer, scheduler, confi
         scheduler.step()
 
 
-def train_epoch(model, train_loader, criterion, optimizer, config, down_sampled=False):
+def train_critical(
+    model, train_loader, test_loader, criterion, optimizer, scheduler, config
+):
+    for epoch in tqdm(range(config.deficit_removal)):
+        train_loss, train_accuracy = train_epoch(
+            model, train_loader, criterion, optimizer, down_sampled=True
+        )
+        test_loss, test_accuracy = test(model, test_loader, criterion)
+        take_log(
+            {
+                "train_loss": train_loss,
+                "test_loss": test_loss,
+                "train_accuracy": train_accuracy,
+                "test_accuracy": test_accuracy,
+                "epoch": epoch,
+            }
+        )
+        scheduler.step()
+
+
+def train_epoch(model, train_loader, criterion, optimizer, down_sampled=False):
     train_loss = 0
     train_accuracy = 0
     num_data = 0
@@ -165,8 +203,14 @@ def train_epoch(model, train_loader, criterion, optimizer, config, down_sampled=
             images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
         outputs = model(images)
-        _, preds = torch.max(outputs, dim=1)
+        if outputs.ndim > 1:
+            _, preds = torch.max(outputs, dim=1)
+        else:
+            preds = torch.where(outputs > 0.5, 1.0, 0.0)
+
+        # print(outputs, labels)
         loss = criterion(outputs, labels)
+
         train_accuracy += torch.sum(preds == labels).item()
         loss.backward()
         optimizer.step()
@@ -186,7 +230,10 @@ def test(model, test_loader, criterion):
         for images, labels in test_loader:
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
-            _, preds = torch.max(outputs, dim=1)
+            if outputs.ndim > 1:
+                _, preds = torch.max(outputs, dim=1)
+            else:
+                preds = torch.where(outputs > 0.5, 1.0, 0.0)
             loss = criterion(outputs, labels)
             test_loss += loss.item()
             accuracy += torch.sum(preds == labels).item()
@@ -210,11 +257,15 @@ def main():
 
     parser.add_argument("-b", "--batch_size", type=int, default=128)
     parser.add_argument("-lr", "--learning_rate", type=float, default=0.05)
-    parser.add_argument("-e", "--epochs", type=int, default=140)
+    parser.add_argument("-e", "--epochs", type=int, default=160)
     parser.add_argument("--weight_decay", type=float, default=0.001)
     parser.add_argument("--lr_decay", type=float, default=0.97)
     parser.add_argument("-m", "--model", type=str, default="ResNet18")
+    parser.add_argument("--deficit_removal", type=int, default=0)
+    parser.add_argument("--deficit", type=str, default="subsample")
     parser.add_argument("--aug", action="store_true")
+    parser.add_argument("--num_classes", type=int, default=10)
+    parser.add_argument("--project", type=str, default="critical")
 
     args = parser.parse_args()
 
@@ -227,11 +278,14 @@ def main():
             "lr_decay": args.lr_decay,
             "model": args.model,
             "aug": args.aug,
+            "deficit_removal": args.deficit_removal,
+            "deficit": args.deficit,
+            "num_classes": args.num_classes,
+            "project": args.project,
         }
     )
 
 
 if __name__ == "__main__":
     print(torch.cuda.is_available())
-
     main()
