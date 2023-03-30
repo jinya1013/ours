@@ -4,6 +4,7 @@ res.txt
 run.sh
 wandb
 data
+cifar-100-python
 src/__pycache__
 .python-version
 .data
