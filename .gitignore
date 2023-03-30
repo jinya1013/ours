@@ -3,6 +3,8 @@ requirement.txt
 res.txt
 run.sh
 wandb
+10_SGD
+cifar-100-python.tar.gz
 data
 cifar-100-python
 src/__pycache__
