@@ -14,7 +14,7 @@ import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 
-from network import AllCNN
+from models import AllCNN
 
 PROJECT_NAME = "critical"
 device: Union[int, str] = 0 if torch.cuda.is_available() else "cpu"
