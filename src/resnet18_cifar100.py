@@ -815,7 +815,6 @@ def validate(valid_loader, model, criterion, task_id, device):
     running_loss = 0
 
     for X, y_true in valid_loader:
-
         X = X.to(device)
         y_true = y_true.to(device)
 
@@ -1042,7 +1041,6 @@ def training_loop(
 
 
 def train(args, model, train_loader, test_loader, device, task_id=0):
-
     loss = torch.nn.CrossEntropyLoss()
     # loss = torch.nn.BCEWithLogitsLoss()
 
@@ -1200,7 +1198,6 @@ def resnet_conv_block_pruning(
     x_batch = F.pad(x_batch, p2d, "constant", 0)
 
     for k in range(filters.size(0)):
-
         if (block_out_mean[k]).norm(dim=(0, 1)) == 0:
             if layer_num == 0:
                 net.tasks_masks[task_id][0][k] = zero_kernel
@@ -1757,9 +1754,6 @@ def select_subnetwork_icarl(model, x, prototypes, num_learned=10):
     return j0
 
 
-# prototypes_mean, prototypes_std = get_prototypes(net)
-
-
 def select_subnetwork_maxoutput(model, x, num_learned, device):
     max_out = []
     for task_id in range(num_learned):
@@ -1839,7 +1833,6 @@ def eval(
             acc_task_classification = 0
             correct_preds = 0
             for x, y_true in test_loaders[task_id]:
-
                 x_tmp = torchvision.transforms.RandomHorizontalFlip(p=1)(x)
 
                 x_tmp = torch.cat((x, x_tmp))

@@ -6,7 +6,7 @@ wandb
 10_SGD
 cifar-100-python.tar.gz
 data
-cifar-100-python
+cifar-100-python/
 src/__pycache__
 .python-version
 .data
