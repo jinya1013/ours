@@ -4,6 +4,20 @@ import torch.nn.functional as F
 import torch.nn.init as init
 import copy
 
+import numpy as np
+
+
+def euclidean_distance(a, b):
+    return torch.sum((a - b[None]) ** 2, dim=1)
+
+
+def set_task(model, task_id):
+    model.task_id = task_id
+    for layer in range(len(model.num_blocks)):
+        for block in range(model.num_blocks[layer]):
+            Block = list(model.children())[layer + 2][block]
+            Block.task_id = task_id
+
 
 class NonAffineBN(nn.BatchNorm2d):
     def __init__(self, dim):
@@ -77,11 +91,9 @@ class BasicBlock(nn.Module):
         self.in_planes = in_planes
         self.stride = stride
 
-        self.block_masks = self._make_masks(
-            in_planes, planes, stride
-        )  # masks for current task
+        self.block_masks = self._make_masks(in_planes, planes, stride)
 
-        self.tasks_masks = []  # mask archive
+        self.tasks_masks = []
 
         self.planes = planes
         self.in_planes = in_planes
@@ -111,27 +123,9 @@ class BasicBlock(nn.Module):
                 )
 
     def add_mask(self):
-        """
-        Append a deep copy of the current block_masks to the tasks_masks list.
-        """
         self.tasks_masks.append(copy.deepcopy(self.block_masks))
 
     def _make_masks(self, in_planes, planes, stride):
-        """Create and return a list of masks depending on the provided parameters.
-
-        The masks have shapes corresponding to the weight tensors of the
-        convolutional layers in the block.
-
-        Args:
-            in_planes (int): The number of input channels.
-            planes (int): The number of output channels for the first and second
-                convolutional layers.
-            stride (int): The stride value for the first convolutional layer.
-
-        Returns:
-            List[torch.Tensor]: A list of masks with specific shapes depending
-                on the provided parameters.
-        """
         if stride != 1 or in_planes != self.expansion * planes:
             mask = [
                 torch.ones(planes, in_planes, 3, 3),
@@ -148,18 +142,6 @@ class BasicBlock(nn.Module):
         return mask
 
     def forward(self, x):
-        """Compute the output of the BasicBlock using input tensor x.
-
-        Applies the convolutional layers and the shortcut connection, and
-        performs element-wise addition between the output of the second
-        batch normalization layer and the shortcut connection.
-
-        Args:
-            x (torch.Tensor): The input tensor with shape (batch_size, in_planes, height, width).
-
-        Returns:
-            torch.Tensor: The output tensor with shape (batch_size, planes, output_height, output_width).
-        """
         active_conv = self.conv1.weight * self.tasks_masks[self.task_id][0].to(
             self.device
         )
@@ -227,7 +209,7 @@ class ResNet(nn.Module):
         self.num_blocks = num_blocks
 
         self.num_classes = args.num_classes
-        self.num_classes_per_task = args.num_classes_per_task
+        self.num_classes_first_task = args.num_classes_first_task
         self.num_tasks = 0
         self.args = args
 
@@ -270,6 +252,7 @@ class ResNet(nn.Module):
         self.apply(_weights_init)
 
         self.tasks_masks = []
+        self.class_task_map = {}
 
         self._add_mask(task_id=0)
 
@@ -278,17 +261,6 @@ class ResNet(nn.Module):
         self.masks_intersection = copy.deepcopy(self.tasks_masks[0])
 
     def _add_mask(self, task_id):
-        """Add a mask to the network for a specific task.
-
-        This function creates a new mask for the given task ID and appends
-        it to the tasks_masks list. It also updates the tasks_masks list
-        for the current task ID by copying masks from the individual blocks
-        of the network.
-
-        Args:
-            task_id (int): The ID of the task for which to add a mask.
-
-        """
         self.num_tasks += 1
         network_mask = [
             copy.deepcopy(self.conv1_masks),
@@ -298,7 +270,7 @@ class ResNet(nn.Module):
 
         self.tasks_masks.append(copy.deepcopy(network_mask))
 
-        for layer in range(len(network_mask[1])):
+        for layer in range(len(network_mask[1])):  # layer x block x 0/1
             for block in range(len(network_mask[1][layer])):
                 Block = list(list(self.children())[layer + 2])[block]
                 Block.add_mask()
@@ -311,58 +283,39 @@ class ResNet(nn.Module):
                     task_id
                 ][-1]
 
-        index = self.num_classes_per_task * task_id
-        # Check if the current task's class range doesn't exceed the total number of classes
-        if index + self.num_classes_per_task < self.num_classes - 1:
-            # Set the masks for classes beyond the current task's range to 0
-            self.tasks_masks[-1][-1][-1][(index + self.num_classes_per_task) :] = 0
-            self.tasks_masks[-1][-1][-2][(index + self.num_classes_per_task) :, :] = 0
-        # Check if it is not the first task
+        index = 0 if task_id == 0 else self.num_classes_first_task + task_id - 1
+        num_classes_task = self.num_classes_first_task if task_id == 0 else 1
+        if index + num_classes_task < self.num_classes - 1:
+            self.tasks_masks[-1][-1][-1][(index + num_classes_task) :] = 0
+            self.tasks_masks[-1][-1][-2][(index + num_classes_task) :, :] = 0
+
         if task_id > 0:
-            # Set the masks for classes before the current task's range to 0
             self.tasks_masks[-1][-1][-1][:index] = 0
             self.tasks_masks[-1][-1][-2][:index, :] = 0
 
     def set_masks_union(self, num_learned=-1):
-        """
-        Set the union of masks for a given number of learned tasks.
-
-        This function computes the union of masks for the specified number
-        of tasks (or all tasks if num_learned is not specified) and stores
-        the result in the masks_union attribute.
-
-        Args:
-            num_learned (int, optional): The number of learned tasks to consider for the union. Defaults to -1.
-        """
         self.masks_union = copy.deepcopy(self.tasks_masks[0])
 
-        # If num_learned is not specified, set it to the total number of tasks
         if num_learned < 0:
             num_learned = self.num_tasks
 
-        # Iterate through the learned tasks and compute the union of masks
         for id in range(1, num_learned):
-            # Compute the union of conv1_masks
             self.masks_union[0] = 1 * torch.logical_or(
                 self.masks_union[0], self.tasks_masks[id][0]
             )
-
             for layer in range(len(self.masks_union[1])):
                 for block in range(0, len(self.masks_union[1][layer])):
-                    # Compute the union of conv_masks in each layer and block
                     for conv in range(2):
                         self.masks_union[1][layer][block][conv] = 1 * torch.logical_or(
                             self.masks_union[1][layer][block][conv],
                             self.tasks_masks[id][1][layer][block][conv],
                         )
 
-                    # Compute the union of downsample_masks in each layer and block
                     self.masks_union[1][layer][block][-1] = 1 * torch.logical_or(
                         self.masks_union[1][layer][block][-1],
                         self.tasks_masks[id][1][layer][block][-1],
                     )
 
-            # Compute the union of linear_masks
             self.masks_union[-1][0] = 1 * torch.logical_or(
                 self.masks_union[-1][0], self.tasks_masks[id][-1][0]
             )
@@ -371,24 +324,14 @@ class ResNet(nn.Module):
             )
 
     def set_masks_intersection(self):
-        """
-        Set the intersection of masks for all learned tasks.
-
-        This function computes the intersection of masks for all learned tasks
-        and stores the result in the masks_intersection attribute.
-        """
         self.masks_intersection = copy.deepcopy(self.tasks_masks[0])
 
-        # Iterate through the learned tasks and compute the intersection of masks
         for id in range(1, self.num_tasks):
-            # Compute the intersection of conv1_masks
             self.masks_intersection[0] = 1 * torch.logical_and(
                 self.masks_intersection[0], self.tasks_masks[id][0]
             )
-
             for layer in range(len(self.masks_intersection[1])):
                 for block in range(0, len(self.masks_intersection[1][layer])):
-                    # Compute the intersection of conv_masks in each layer and block
                     for conv in range(2):
                         self.masks_intersection[1][layer][block][
                             conv
@@ -397,7 +340,6 @@ class ResNet(nn.Module):
                             self.tasks_masks[id][1][layer][block][conv],
                         )
 
-                    # Compute the intersection of downsample_masks in each layer and block
                     self.masks_intersection[1][layer][block][
                         -1
                     ] = 1 * torch.logical_and(
@@ -405,7 +347,6 @@ class ResNet(nn.Module):
                         self.tasks_masks[id][1][layer][block][-1],
                     )
 
-            # Compute the intersection of linear_masks
             self.masks_intersection[-1][0] = 1 * torch.logical_and(
                 self.masks_intersection[-1][0], self.tasks_masks[id][-1][0]
             )
@@ -414,30 +355,13 @@ class ResNet(nn.Module):
             )
 
     def set_trainable_masks(self, task_id):
-        """
-        Set the trainable masks for a specific task.
-
-        This function computes the trainable masks for the given task ID
-        and stores the result in the trainable_mask attribute. For the first
-        task (task_id == 0), the trainable masks are equal to the task's masks.
-        For subsequent tasks, the trainable masks are computed by subtracting
-        the union of previous tasks' masks from the current task's masks.
-
-        Args:
-            task_id (int): The ID of the task for which to set trainable masks.
-        """
         if task_id > 0:
-            # Compute the trainable conv1_masks
             self.trainable_mask[0] = copy.deepcopy(
                 1 * ((self.tasks_masks[task_id][0] - self.masks_union[0]) > 0)
             )
-
-            # Iterate through layers and blocks to compute the trainable masks
             for layer in range(len(self.trainable_mask[1])):  # layer x block x 0/1
                 for block in range(len(self.trainable_mask[1][layer])):
                     Block = list(list(self.children())[layer + 2])[block]
-
-                    # Compute the trainable conv_masks for each layer and block
                     for conv in range(2):
                         self.trainable_mask[1][layer][block][conv] = copy.deepcopy(
                             1
@@ -450,7 +374,6 @@ class ResNet(nn.Module):
                             )
                         )
 
-                    # Compute the trainable downsample_masks if the block has a downsample layer
                     if Block.stride != 1 or Block.in_planes != Block.planes:
                         self.trainable_mask[1][layer][block][-1] = copy.deepcopy(
                             1
@@ -463,7 +386,6 @@ class ResNet(nn.Module):
                             )
                         )
 
-            # Compute the trainable linear_masks
             self.trainable_mask[-1][0] = copy.deepcopy(
                 1 * ((self.tasks_masks[task_id][-1][0] - self.masks_union[-1][0]) > 0)
             )
@@ -471,64 +393,24 @@ class ResNet(nn.Module):
                 1 * ((self.tasks_masks[task_id][-1][1] - self.masks_union[-1][1]) > 0)
             )
         else:
-            # For the first task, the trainable masks are equal to the task's masks
             self.trainable_mask = copy.deepcopy(self.tasks_masks[0])
 
     def _make_layer(self, block, planes, num_blocks, stride):
-        """
-        Create a layer with a sequence of blocks and their corresponding masks.
-
-        This function constructs a layer with the specified number of blocks, planes,
-        and initial stride. It also creates a list of masks for each block in the layer.
-        The layer is returned as an nn.Sequential object, and the list of masks is returned
-        as a separate list.
-
-        Args:
-            block (nn.Module): The type of block to use in the layer (e.g., BasicBlock).
-            planes (int): The number of output channels for each block in the layer.
-            num_blocks (int): The number of blocks to include in the layer.
-            stride (int): The stride for the first block in the layer.
-
-        Returns:
-            nn.Sequential: The layer containing the sequence of blocks.
-            list: The list of masks corresponding to each block in the layer.
-        """
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         layers_masks = []
-
-        # Iterate through the blocks, create each block and its corresponding mask
         for stride in strides:
             basicblock = block(self.in_planes, planes, self.args, self.device, stride)
             layers.append(basicblock)
             layers_masks.append(basicblock.block_masks)
-
-            # Update the number of input channels for the next block
             self.in_planes = planes * block.expansion
 
-        # Return the layer as an nn.Sequential object and the list of masks
         return nn.Sequential(*layers), layers_masks
 
     def features(self, x):
-        """
-        Compute the features of the input tensor x using the network's convolutional layers.
-
-        This function processes the input tensor x through the network's convolutional layers,
-        applying the task-specific masks as needed. The final feature tensor is reshaped into
-        a 2D tensor and returned.
-
-        Args:
-            x (torch.Tensor): The input tensor with shape (batch_size, channels, height, width).
-
-        Returns:
-            torch.Tensor: The output feature tensor with shape (batch_size, num_features).
-        """
-        # Apply the task-specific mask to the first convolution layer
         active_conv = self.conv1.weight * self.tasks_masks[self.task_id][0].to(
             self.device
         )
-
-        # Process the input tensor through the first masked convolution layer
         out = F.conv2d(
             x,
             weight=active_conv,
@@ -536,42 +418,21 @@ class ResNet(nn.Module):
             stride=self.conv1.stride,
             padding=self.conv1.padding,
         )
-
-        # Apply the ReLU activation function and the batch normalization layer
         out = F.relu(self.bn1(out, self.task_id))
 
-        # Process the tensor through the remaining convolutional layers
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
 
-        # Apply average pooling to the output tensor
         out = F.avg_pool2d(out, out.size()[3])
-
-        # Reshape the output tensor into a 2D tensor (batch_size, num_features)
         out = out.view(out.size(0), -1)
         return out
 
-    def forward(self, x):
-        """
-        Forward pass of the input tensor x through the network.
-
-        This function processes the input tensor x through the network's layers,
-        applying the task-specific masks as needed. The final output tensor is returned.
-
-        Args:
-            x (torch.Tensor): The input tensor with shape (batch_size, channels, height, width).
-
-        Returns:
-            torch.Tensor: The output tensor with shape (batch_size, num_classes).
-        """
-        # Apply the task-specific mask to the first convolution layer
+    def forward(self, x, prototype_vector=None):
         active_conv = self.conv1.weight * self.tasks_masks[self.task_id][0].to(
             self.device
         )
-
-        # Process the input tensor through the first masked convolution layer
         out = F.conv2d(
             x,
             weight=active_conv,
@@ -579,51 +440,54 @@ class ResNet(nn.Module):
             stride=self.conv1.stride,
             padding=self.conv1.padding,
         )
-
-        # Apply the ReLU activation function and the batch normalization layer
         out = F.relu(self.bn1(out, self.task_id))
 
-        # Process the tensor through the remaining convolutional layers
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
 
-        # Apply average pooling to the output tensor
         out = F.avg_pool2d(out, out.size()[3])
+        features = out.view(out.size(0), -1)
 
-        # Reshape the output tensor into a 2D tensor (batch_size, num_features)
-        feature = out.view(out.size(0), -1)
+        if prototype_vector is not None:
+            features = torch.cat((features, prototype_vector), dim=0)
 
-        # Apply the task-specific mask to the linear layer
         active_weight = self.linear.weight * self.tasks_masks[self.task_id][-1][0].to(
             self.device
         )
         active_bias = self.linear.bias * self.tasks_masks[self.task_id][-1][1].to(
             self.device
         )
+        out = F.linear(features, weight=active_weight, bias=active_bias)
 
-        # Process the feature tensor through the masked linear layer
-        out = F.linear(feature, weight=active_weight, bias=active_bias)
+        return out, features
 
-        return out, feature
+    def predict(self, x, prototype_vectors):
+        min_distance = np.inf * torch.ones((len(x),), device=self.device)
+        y_preds = -1.0 * torch.ones((len(x),), device=self.device)
+
+        for class_, prototype_vector in prototype_vectors.items():
+            prototype_vector = prototype_vector.to(self.device)
+            set_task(self, self.class_task_map[class_])
+            feature = self.features(x)
+            distance = euclidean_distance(feature, prototype_vector).to(self.device)
+            y_preds = torch.where(
+                distance < min_distance,
+                torch.tensor(
+                    class_,
+                    dtype=torch.float32,
+                    device="cuda:0" if torch.cuda.is_available() else "cpu",
+                ),
+                y_preds,
+            )
+            min_distance = torch.where(distance < min_distance, distance, min_distance)
+        return y_preds
 
     def _save_masks(self, file_name="net_masks.pt"):
-        """
-        Save the masks of all tasks to a file.
-
-        This function saves the masks for each task in the network into a dictionary
-        and then stores that dictionary in a file with the given file name. The masks
-        are stored with keys representing their layer, block, convolution number, and
-        task ID.
-
-        Args:
-            file_name (str, optional): The name of the file to save the masks. Defaults to "net_masks.pt".
-        """
         masks_database = {}
 
         for task_id in range(self.num_tasks):
-            # Save the mask for the first convolution layer
             masks_database["conv1.mask.task{}".format(task_id)] = self.tasks_masks[
                 task_id
             ][0]
@@ -631,7 +495,6 @@ class ResNet(nn.Module):
             for layer in range(len(self.num_blocks)):
                 for block in range(self.num_blocks[layer]):
                     for conv_num in range(2):
-                        # Save the mask for each convolution within a block
                         name = "layer{}.{}.conv{}.mask.task{}".format(
                             layer + 1, block, conv_num + 1, task_id
                         )
@@ -639,7 +502,6 @@ class ResNet(nn.Module):
                             block
                         ][conv_num]
 
-                    # Save the mask for the shortcut in each block
                     name = "layer{}.{}.shortcut.mask.task{}".format(
                         layer + 1, block, task_id
                     )
@@ -647,7 +509,6 @@ class ResNet(nn.Module):
                         -1
                     ]
 
-            # Save the masks for the linear layer's weight and bias
             masks_database[
                 "linear.weight.mask.task{}".format(task_id)
             ] = self.tasks_masks[task_id][-1][0]
@@ -655,35 +516,20 @@ class ResNet(nn.Module):
                 "linear.bias.mask.task{}".format(task_id)
             ] = self.tasks_masks[task_id][-1][1]
 
-        # Save the masks database to the specified file
         torch.save(masks_database, file_name)
 
     def _load_masks(self, file_name="net_masks.pt", num_tasks=1):
-        """
-        Load the masks of all tasks from a file.
-
-        This function loads the masks for each task in the network from a file with
-        the given file name. The masks are loaded into the tasks_masks attribute
-        and additional masks are added if the number of tasks specified is greater
-        than the number of tasks currently in the network.
-
-        Args:
-            file_name (str, optional): The name of the file to load the masks from. Defaults to "net_masks.pt".
-            num_tasks (int, optional): The number of tasks to load masks for. Defaults to 1.
-        """
         masks_database = torch.load(file_name)
 
         for task_id in range(num_tasks):
-            # Load the mask for the first convolution layer
             self.tasks_masks[task_id][0] = masks_database[
                 "conv1.mask.task{}".format(task_id)
             ]
 
-            for layer in range(len(self.num_blocks)):
+            for layer in range(len(self.num_blocks)):  # layer x block x 0/1
                 for block in range(self.num_blocks[layer]):
                     Block = list(list(self.children())[layer + 2])[block]
                     for conv in range(2):
-                        # Load the mask for each convolution within a block
                         name = "layer{}.{}.conv{}.mask.task{}".format(
                             layer + 1, block, conv + 1, task_id
                         )
@@ -692,7 +538,6 @@ class ResNet(nn.Module):
                             conv
                         ] = Block.tasks_masks[task_id][conv]
 
-                    # Load the mask for the shortcut in each block
                     name = "layer{}.{}.shortcut.mask.task{}".format(
                         layer + 1, block, task_id
                     )
@@ -701,7 +546,6 @@ class ResNet(nn.Module):
                         task_id
                     ][-1]
 
-            # Load the masks for the linear layer's weight and bias
             self.tasks_masks[task_id][-1][0] = masks_database[
                 "linear.weight.mask.task{}".format(task_id)
             ]
@@ -709,11 +553,9 @@ class ResNet(nn.Module):
                 "linear.bias.mask.task{}".format(task_id)
             ]
 
-            # Add mask for the next task if needed
             if task_id + 1 < num_tasks:
                 self._add_mask(task_id + 1)
 
-        # Set the masks union and masks intersection after loading all masks
         self.set_masks_union()
         self.set_masks_intersection()
 
@@ -743,71 +585,24 @@ def resnet110(num_classes):
 
 
 def init_model(args, device):
-    """
-    Initialize a ResNet-18 model with the given arguments and device.
-
-    This function creates a ResNet-18 model with the specified arguments and
-    moves the model to the target device. It returns the initialized model.
-
-    Args:
-        args: A namespace or dictionary containing the arguments for the ResNet-18 model.
-        device (torch.device): The device to move the model to (e.g., 'cpu' or 'cuda').
-
-    Returns:
-        model (nn.Module): The initialized ResNet-18 model.
-    """
     model = resnet18(args, device)
     model = model.to(device)
     return model
 
 
 def resnet_total_params(model):
-    """
-    Calculate the total number of non-zero parameters in a ResNet model.
-
-    This function computes the total number of non-zero parameters in the
-    given ResNet model by iterating through its state dictionary and counting
-    the number of elements in each parameter tensor that are not zero.
-
-    Args:
-        model (nn.Module): The ResNet model to calculate the total number of non-zero parameters for.
-
-    Returns:
-        total_number (int): The total number of non-zero parameters in the model.
-    """
     total_number = 0
-    # Iterate through the model's state dictionary
     for param_name in list(model.state_dict()):
-        # Get the parameter tensor
         param = model.state_dict()[param_name]
-        # Count non-zero elements and add to the total number
         total_number += torch.numel(param[param != 0])
 
     return total_number
 
 
 def resnet_total_params_mask(model, task_id=0):
-    """
-    Calculate the total number of non-zero parameters in a ResNet model using masks for a given task.
-
-    This function computes the total number of non-zero parameters in the
-    given ResNet model for a specific task using the associated masks. It
-    iterates through the model's named parameters and counts the number of
-    non-zero elements in each parameter tensor using the masks.
-
-    Args:
-        model (nn.Module): The ResNet model to calculate the total number of non-zero parameters for.
-        task_id (int, optional): The task ID for which to calculate the total number of non-zero parameters. Defaults to 0.
-
-    Returns:
-        total (int): The total number of non-zero parameters in the model for the given task.
-        total_number_conv (int): The total number of non-zero parameters in the convolutional layers for the given task.
-        total_number_fc (int): The total number of non-zero parameters in the fully connected layer for the given task.
-    """
     total_number_conv = 0
     total_number_fc = 0
 
-    # Iterate through the model's named parameters
     for name, param in list(model.named_parameters()):
         if name == "conv1":
             total_number_conv += model.tasks_masks[task_id][0].sum()
@@ -840,35 +635,16 @@ def resnet_total_params_mask(model, task_id=0):
 
 
 def resnet_get_architecture(model):
-    """
-    Gets the architecture of a ResNet model in terms of the number of
-    active filters in each convolutional and fully-connected layer.
-
-    Args:
-        model (torch.nn.Module): A ResNet model.
-
-    Returns:
-        arch: A list of lists, where the first list contains the number of active
-        filters in each convolutional layer and the second list contains the
-        number of active units in the fully-connected layer.
-
-    """
     arch = []
     convs = []
     fc = []
 
-    # Get the number of active filters in the first convolutional layer
     convs.append(torch.sum(model.conv1_masks.sum(dim=(1, 2, 3)) > 0).item())
-
-    # Loop over each residual block in the model
     for block, num_block in enumerate(model.num_blocks):
         block_masks = []
-        # Loop over each convolutional layer in the block
         for i in range(num_block):
             block_conv_masks = []
-            # Loop over the two convolutional layers in each block
             for conv_num in range(2):
-                # Get the number of active filters in the current convolutional layer
                 block_conv_masks.append(
                     torch.sum(
                         model.layers_masks[block][i][conv_num].sum(dim=(1, 2, 3)) > 0
@@ -881,7 +657,6 @@ def resnet_get_architecture(model):
 
     arch.append(convs)
 
-    # Get the number of active units in the fully-connected layer
     fc.append(torch.sum(model.linear_masks[0].sum(dim=0) > 0).item())
 
     arch.append(fc)

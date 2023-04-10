@@ -1,5 +1,4 @@
-import torchvision
-
+import torchvision  # type: ignore
 import torch
 import numpy as np
 import copy
@@ -40,9 +39,37 @@ def load_dataset(dataset_name):
     return train_dataset, test_dataset
 
 
+from torch.utils.data import WeightedRandomSampler
+
+
 def get_loaders(train_dataset, test_dataset, batch_size):
+    targets = torch.Tensor([y for _, y in train_dataset])
+    num_classes = len(torch.unique(targets))
+
+    # Compute class weights
+    class_counts = {i: 0 for i in range(10)}
+    print("num_classes", num_classes)
+    print("targets", targets)
+    for target in targets:
+        class_counts[int(target)] += 1
+
+    class_weights = {
+        class_: 1.0 / count for class_, count in class_counts.items() if count > 0
+    }
+
+    print(class_weights)
+
+    # Assign sample weights based on their respective class weights
+    sample_weights = [class_weights[int(target)] for target in targets]
+
+    # Create a WeightedRandomSampler instance using the sample weights
+    sampler = WeightedRandomSampler(
+        sample_weights, num_samples=len(targets), replacement=True
+    )
+
+    # Create DataLoaders
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=2
+        train_dataset, batch_size=batch_size, sampler=sampler, num_workers=2
     )
 
     test_loader = torch.utils.data.DataLoader(
@@ -73,7 +100,14 @@ def task_construction(task_labels, dataset_name, order=None):
         test_dataset.targets = test_targets.clone()
 
     train_dataset = split_dataset_by_labels(train_dataset, task_labels)
-    test_dataset = split_dataset_by_labels(test_dataset, task_labels)
+
+    test_task_labels = []
+    for i in range(len(task_labels)):
+        test_task_labels.append(task_labels[i][:])
+        for j in range(i):
+            test_task_labels[i].extend(task_labels[j])
+
+    test_dataset = split_dataset_by_labels(test_dataset, test_task_labels)
     return train_dataset, test_dataset
 
 
@@ -88,89 +122,22 @@ def split_dataset_by_labels(dataset, task_labels):
     return datasets
 
 
-from torch.utils.data import Dataset, DataLoader, Subset
-
-
-def divide_dataset(dataset, num_classes_first_task, order=None):
-    # Get the total number of classes in the dataset
-    num_classes_total = len(set(dataset.targets))
-
-    # Ensure the number of classes for the first task is valid
-    if num_classes_first_task < 2 or num_classes_first_task >= num_classes_total:
-        raise ValueError(
-            "num_classes_first_task must be greater than 1 and less than the total number of classes"
-        )
-
-    # Find the indices for each class
-    class_indices = {label: [] for label in set(dataset.targets)}
-    for idx, label in enumerate(dataset.targets):
-        class_indices[label].append(idx)
-
-    # Divide the dataset into tasks
-    divided_dataset = []
-    if order is not None:
-        first_task_classes = order[:num_classes_first_task]
-        remaining_classes = order[num_classes_first_task:num_classes_total]
-    else:
-        first_task_classes = list(range(num_classes_first_task))
-        remaining_classes = list(range(num_classes_first_task, num_classes_total))
-
-    # Create the first task dataset
-    first_task_indices = []
-    for label in first_task_classes:
-        first_task_indices.extend(class_indices[label])
-    divided_dataset.append(Subset(dataset, first_task_indices))
-
-    # Create the remaining tasks datasets
-    for label in remaining_classes:
-        divided_dataset.append(Subset(dataset, class_indices[label]))
-
-    return divided_dataset
-
-
-def create_labels(num_classes, num_tasks, num_classes_per_task):
-    """
-    Creates a label matrix for a multi-task classification problem.
-
-    Args:
-        num_classes (int): The total number of classes.
-        num_tasks (int): The number of tasks.
-        num_classes_per_task (int): The number of classes per task.
-
-    Returns:
-        np.ndarray: A label matrix of shape (num_tasks, num_classes_per_task),
-                    where each row represents the class labels for a single task.
-    """
-    # Initialize an array with all class indices
-    tasks_order = np.arange(num_classes)
-
-    # Reshape the array to create num_tasks sets of num_classes_per_task class indices
-    labels = tasks_order.reshape((num_tasks, num_classes_per_task))
-
+def create_labels(num_classes, num_tasks, num_classes_first_task):
+    classes_first_task = [list(range(0, num_classes_first_task))]
+    classes_remained_task = [[i] for i in range(num_classes_first_task, num_classes)]
+    labels = classes_first_task + classes_remained_task
     return labels
 
 
-def set_task(model, task_id):
-    model.task_id = task_id
-    for layer in range(len(model.num_blocks)):
-        for block in range(model.num_blocks[layer]):
-            Block = list(model.children())[layer + 2][block]
-            Block.task_id = task_id
+def create_class_task_map(num_classes_first_task, order):
+    class_task_map = {}
 
+    for i, class_label in enumerate(order):
+        if i < num_classes_first_task:
+            task_number = 0
+        else:
+            task_number = i - num_classes_first_task + 1
 
-if __name__ == "__main__":
-    from torchvision.datasets import CIFAR10
-    from torchvision.transforms import ToTensor
+        class_task_map[class_label] = task_number
 
-    # Load CIFAR-10 dataset
-    cifar10_dataset = CIFAR10(
-        root="./data", train=True, download=True, transform=ToTensor()
-    )
-
-    # Divide the dataset into tasks
-    num_classes_first_task = 3
-    divided_dataset = divide_dataset(cifar10_dataset, num_classes_first_task)
-
-    # Check the output
-    for i, task_dataset in enumerate(divided_dataset):
-        print(f"Task {i + 1}: {len(task_dataset)} samples")
+    return class_task_map

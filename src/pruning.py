@@ -2,161 +2,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torchvision
+import torchvision  # type: ignore
 
 import numpy as np
 
-from data import mean, std, set_task
-from metrics import accuracy
+from data import mean, std
 from models import resnet_total_params_mask
-from experiment import training_loop, features_out
-
-
-def compute_importances(model, signal, device, task_id=0):
-    importances = []
-    total_importance_per_neuron = []
-
-    fc_weights = model.linear.weight.cpu().detach() * model.tasks_masks[task_id][-1][0]
-    # scores = np.abs(signal.mean(dim=0))*fc_weights.abs()
-    scores = signal.mean(dim=0) * fc_weights
-
-    total_importance_per_neuron.append(scores.sum(axis=0))
-
-    importances.append(scores)
-
-    importances = torch.cat(importances)
-
-    return importances, total_importance_per_neuron
-
-
-def joint_importance(model, signal, device, num_learned):
-    importances = []
-    total_importance_per_neuron = []
-    # prototypes_mean, prototypes_std = get_prototypes(model)
-    fc_weights = model.linear.weight.cpu().detach()
-
-    for task_id in range(num_learned):
-        set_task(model, task_id)
-        signal_task = features_out(model, signal, device)
-
-        # scores = torch.abs(signal_task).mean(dim=0)*fc_weights.abs()*model.tasks_masks[task_id][-1][0]
-        scores = (
-            signal_task.mean(dim=0) * fc_weights * model.tasks_masks[task_id][-1][0]
-        )
-
-        total_importance_per_neuron.append(scores.sum(axis=0))
-
-        importances.append(scores)
-        del signal_task
-
-    return importances, total_importance_per_neuron
-
-
-def distance(Test, Train, mask):
-    # return torch.sum(torch.abs(Test[mask!=0]-Train[mask!=0])/Train[mask!=0])/mask.sum()
-    return torch.sum(torch.abs(Test - Train)) / mask.sum()
-
-
-def compute_importance_train(model, train_dataset, device):
-    importances_train = []
-    total_importances_train = []
-    for task_id in range(model.num_tasks):
-        idx = np.random.permutation(np.arange(len(train_dataset[task_id])))
-        x = torch.FloatTensor(train_dataset[task_id].data)[idx]
-        x = x.permute(0, 3, 1, 2)
-        x = torchvision.transforms.Normalize(mean, std)(x.float() / 255)
-
-        set_task(model, task_id)
-        x = features_out(model, x, device)
-
-        importances, total_importance_per_neuron = compute_importances(
-            model, x, device, task_id=task_id
-        )
-
-        importances_train.append(importances)
-        total_importances_train.append(total_importance_per_neuron)
-
-        del importances, total_importance_per_neuron, x
-
-    return importances_train, total_importances_train
-
-
-def select_subnetwork(model, x, importances_train, device, num_layers=1):
-    num_learned = len(importances_train)
-    importance_x, total_importance_x = joint_importance(model, x, device, num_learned)
-    dists = []
-    for j in range(len(importance_x)):
-        dist = 0
-
-        for l in range(num_layers):
-            dist += distance(
-                importance_x[j], importances_train[j], model.tasks_masks[j][-1][0].cpu()
-            )
-
-        dists.append(dist.item())
-
-    j0 = np.argmin(dists)
-
-    return j0
-
-
-# def get_prototypes(model):
-#     prototypes_mean = []
-#     prototypes_std = []
-#     for task_id in range(model.num_tasks):
-#         idx = np.random.permutation(np.arange(len(train_dataset[task_id])))[:2000]
-#         x = torch.FloatTensor(train_dataset[task_id].data)[idx]
-#         x = x.permute(0, 3, 1, 2)
-#         x = torchvision.transforms.Normalize(mean, std)(x.float() / 255)
-
-#         set_task(model, task_id)
-#         x = features_out(model, x)
-
-#         prototypes_mean.append(x.mean(dim=0))
-#         prototypes_std.append(x.std(dim=0))
-
-#     return prototypes_mean, prototypes_std
-
-
-# def select_subnetwork_icarl(model, x, prototypes, num_learned=10):
-#     dists = []
-#     # prototypes = get_prototypes(model)
-
-#     for task_id in range(num_learned):
-#         set_task(model, task_id)
-#         out = features_out(model, x)
-
-#         dists.append(((out.mean(dim=0) - prototypes[task_id]).abs()).mean())
-
-#     j0 = np.argmin(dists)
-
-#     return j0
-
-
-def select_subnetwork_maxoutput(model, x, num_learned, device):
-    max_out = []
-    for task_id in range(num_learned):
-        set_task(model, task_id)
-        preds = model(x.to(device))
-        max_out.append(
-            torch.max(
-                preds[
-                    :,
-                    task_id
-                    * model.num_classes_per_task : (
-                        (task_id + 1) * model.num_classes_per_task
-                    ),
-                ],
-                dim=1,
-            )[0]
-            .sum()
-            .cpu()
-            .detach()
-        )
-
-    j0 = np.argmax(max_out)
-
-    return j0
+from train import training_loop, set_task, accuracy, prototypical_loss
 
 
 def resnet_fc_pruning(net, alpha, x_batch, task_id, device, start_fc_prune=0):
@@ -274,7 +126,6 @@ def resnet_conv_block_pruning(
     x_batch = F.pad(x_batch, p2d, "constant", 0)
 
     for k in range(filters.size(0)):
-
         if (block_out_mean[k]).norm(dim=(0, 1)) == 0:
             if layer_num == 0:
                 net.tasks_masks[task_id][0][k] = zero_kernel
@@ -604,6 +455,7 @@ def iterative_pruning(
     net,
     train_loader,
     test_loader,
+    prototype_vectors,
     x_prune,
     task_id,
     device,
@@ -613,7 +465,7 @@ def iterative_pruning(
 ):
     cr = 1
     sparsity = 100
-    acc = np.round(100 * accuracy(net, test_loader, device), 2)
+    acc = np.round(100 * accuracy(net, test_loader, prototype_vectors, device), 2)
 
     init_masks_num = resnet_total_params_mask(net, task_id)
 
@@ -633,7 +485,9 @@ def iterative_pruning(
         net.set_trainable_masks(task_id)
 
         after_masks_num = resnet_total_params_mask(net, task_id)
-        acc_before = np.round(100 * accuracy(net, test_loader, device), 2)
+        acc_before = np.round(
+            100 * accuracy(net, test_loader, prototype_vectors, device), 2
+        )
         # curr_arch = lenet_get_architecture(net)
         print("Accuracy before retraining: ", acc_before)
         print(
@@ -654,10 +508,10 @@ def iterative_pruning(
             optimizer = torch.optim.Adam(
                 net.parameters(), lr=args.lr, weight_decay=args.wd
             )
-        # elif args.optimizer == "radam":
-        #     optimizer = RAdam(
-        #         net.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.wd
-        #     )
+        elif args.optimizer == "radam":
+            optimizer = RAdam(
+                net.parameters(), lr=args.lr, betas=(0.9, 0.999), weight_decay=args.wd
+            )
         else:
             optimizer = torch.optim.SGD(
                 net.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.wd
@@ -666,7 +520,11 @@ def iterative_pruning(
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=args.decay_epochs_retrain, gamma=args.gamma
         )
-        loss = torch.nn.CrossEntropyLoss()
+        loss = prototypical_loss
+        # loss = (
+        #     lambda y_hat, y_true, feature: (torch.nn.CrossEntropyLoss())(y_hat, y_true)
+        #     + 1.0 * torch.square(torch.norm(feature, p=2, dim=1) - 1.0).sum()
+        # )
 
         net, _ = training_loop(
             model=net,
@@ -675,6 +533,7 @@ def iterative_pruning(
             scheduler=scheduler,
             train_loader=train_loader,
             valid_loader=test_loader,
+            prototype_vectors=prototype_vectors,
             epochs=args.retrain_epochs,
             task_id=task_id,
             model_name=args.model_name,
@@ -684,9 +543,179 @@ def iterative_pruning(
 
         net.load_state_dict(torch.load(path_to_save, map_location=device))
 
-        acc_after = np.round(100 * accuracy(net, test_loader, device), 2)
+        acc_after = np.round(
+            100 * accuracy(net, test_loader, prototype_vectors, device), 2
+        )
         print("Accuracy after retraining: ", acc_after)
 
         print("-------------------------------------------------")
 
     return net
+
+
+def features_out(model, x, device):
+    i = 0
+    bs = 32
+    out = []
+
+    while i + bs < len(x):
+        out.append(model.features(x[i : (i + bs)].to(device)).cpu().detach())
+
+        i += bs
+
+    if i < len(x) and i + bs >= len(x):
+        out.append(model.features(x[i:].to(device)).cpu().detach())
+
+    out = torch.cat(out)
+
+    return out
+
+
+def compute_importances(model, signal, device, task_id=0):
+    importances = []
+    total_importance_per_neuron = []
+
+    fc_weights = model.linear.weight.cpu().detach() * model.tasks_masks[task_id][-1][0]
+    # scores = np.abs(signal.mean(dim=0))*fc_weights.abs()
+    scores = signal.mean(dim=0) * fc_weights
+
+    total_importance_per_neuron.append(scores.sum(axis=0))
+
+    importances.append(scores)
+
+    importances = torch.cat(importances)
+
+    return importances, total_importance_per_neuron
+
+
+def joint_importance(model, signal, device, num_learned):
+    importances = []
+    total_importance_per_neuron = []
+    # prototypes_mean, prototypes_std = get_prototypes(model)
+    fc_weights = model.linear.weight.cpu().detach()
+
+    for task_id in range(num_learned):
+        set_task(model, task_id)
+        signal_task = features_out(model, signal, device)
+
+        # scores = torch.abs(signal_task).mean(dim=0)*fc_weights.abs()*model.tasks_masks[task_id][-1][0]
+        scores = (
+            signal_task.mean(dim=0) * fc_weights * model.tasks_masks[task_id][-1][0]
+        )
+
+        total_importance_per_neuron.append(scores.sum(axis=0))
+
+        importances.append(scores)
+        del signal_task
+
+    return importances, total_importance_per_neuron
+
+
+def distance(Test, Train, mask):
+    # return torch.sum(torch.abs(Test[mask!=0]-Train[mask!=0])/Train[mask!=0])/mask.sum()
+    return torch.sum(torch.abs(Test - Train)) / mask.sum()
+
+
+def compute_importance_train(model, train_dataset, device):
+    importances_train = []
+    total_importances_train = []
+    for task_id in range(model.num_tasks):
+        idx = np.random.permutation(np.arange(len(train_dataset[task_id])))
+        x = torch.FloatTensor(train_dataset[task_id].data)[idx]
+        x = x.permute(0, 3, 1, 2)
+        x = torchvision.transforms.Normalize(mean, std)(x.float() / 255)
+
+        set_task(model, task_id)
+        x = features_out(model, x, device)
+
+        importances, total_importance_per_neuron = compute_importances(
+            model, x, device, task_id=task_id
+        )
+
+        importances_train.append(importances)
+        total_importances_train.append(total_importance_per_neuron)
+
+        del importances, total_importance_per_neuron, x
+
+    return importances_train, total_importances_train
+
+
+def select_subnetwork(model, x, importances_train, device, num_layers=1):
+    num_learned = len(importances_train)
+    importance_x, total_importance_x = joint_importance(model, x, device, num_learned)
+    dists = []
+    for j in range(len(importance_x)):
+        dist = 0
+
+        for l in range(num_layers):
+            dist += distance(
+                importance_x[j], importances_train[j], model.tasks_masks[j][-1][0].cpu()
+            )
+
+        dists.append(dist.item())
+
+    j0 = np.argmin(dists)
+
+    return j0
+
+
+def get_prototypes(model):
+    prototypes_mean = []
+    prototypes_std = []
+    for task_id in range(model.num_tasks):
+        idx = np.random.permutation(np.arange(len(train_dataset[task_id])))[:2000]
+        x = torch.FloatTensor(train_dataset[task_id].data)[idx]
+        x = x.permute(0, 3, 1, 2)
+        x = torchvision.transforms.Normalize(mean, std)(x.float() / 255)
+
+        set_task(model, task_id)
+        x = features_out(model, x)
+
+        prototypes_mean.append(x.mean(dim=0))
+        prototypes_std.append(x.std(dim=0))
+
+    return prototypes_mean, prototypes_std
+
+
+def select_subnetwork_icarl(model, x, prototypes, num_learned=10):
+    dists = []
+    # prototypes = get_prototypes(model)
+
+    for task_id in range(num_learned):
+        set_task(model, task_id)
+        out = features_out(model, x)
+
+        dists.append(((out.mean(dim=0) - prototypes[task_id]).abs()).mean())
+
+    j0 = np.argmin(dists)
+
+    return j0
+
+
+# prototypes_mean, prototypes_std = get_prototypes(net)
+
+
+def select_subnetwork_maxoutput(model, x, num_learned, device):
+    max_out = []
+    for task_id in range(num_learned):
+        set_task(model, task_id)
+        preds = model(x.to(device))
+        max_out.append(
+            torch.max(
+                preds[
+                    :,
+                    task_id
+                    * model.num_classes_per_task : (
+                        (task_id + 1) * model.num_classes_per_task
+                    ),
+                ],
+                dim=1,
+            )[0]
+            .sum()
+            .cpu()
+            .detach()
+        )
+
+    j0 = np.argmax(max_out)
+
+    return j0

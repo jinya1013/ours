@@ -1,16 +1,27 @@
-import argparse
-import numpy as np
 import torch
-import torchvision
 import random
-import os
+import numpy as np
 import pickle
+import argparse
 
-from data import mean, std, create_labels, task_construction, get_loaders, set_task
-from models import init_model
-from legacy.experiment import train
-from legacy.metrics import accuracy, backward_transfer
+import torchvision  # type: ignore
+import torch
+import os
+
+from data import (
+    mean,
+    std,
+    create_labels,
+    task_construction,
+    create_class_task_map,
+    get_loaders,
+)
+
+from models import init_model, set_task
+
+from train import train, accuracy, update_prototype_vector
 from pruning import iterative_pruning
+from eval import backward_transfer
 
 
 def main():
@@ -50,10 +61,10 @@ def main():
         "--num_classes", type=int, default=100, help="number of classes"
     )
     parser.add_argument(
-        "--num_classes_per_task",
+        "--num_classes_first_task",
         type=int,
         default=10,
-        help="number of classes per task",
+        help="number of classes in the first task",
     )
     parser.add_argument(
         "--num_iters", type=int, default=3, help="number of pruning iterations"
@@ -155,7 +166,6 @@ def main():
     print("STARTED")
     print(args)
 
-    # the order of classes we use for learning
     orders = {
         "default": [i for i in range(args.num_classes)],
         "seed1993": [
@@ -573,13 +583,17 @@ def main():
 
     if TRAIN:
         task_labels = create_labels(
-            args.num_classes, args.num_tasks, args.num_classes_per_task
-        )  # tensor(num_classes, num_classes_per_task)
+            args.num_classes, args.num_tasks, args.num_classes_first_task
+        )
         train_dataset, test_dataset = task_construction(
             task_labels, args.dataset_name, tasks_order
         )
 
         net = init_model(args, device)
+
+        net.class_task_map = create_class_task_map(
+            args.num_classes_first_task, tasks_order
+        )
 
         # torch.save(net.state_dict(), args.path_init_params)
 
@@ -587,14 +601,17 @@ def main():
 
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+        prototype_vectors = {}
+
         start_task = 0
         if start_task > 0:
             path_to_save = (
                 path_results
                 + "{}_task{}_{}classes_{}_{}_it{}_order_{}.pth".format(
                     args.model_name,
+                    args.model_name,
                     start_task,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     args.num_iters,
@@ -607,8 +624,9 @@ def main():
                 file_name=path_results
                 + "{}_task{}_masks_{}classes_{}_{}_it{}_order_{}.pth".format(
                     args.model_name,
+                    args.model_name,
                     start_task,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     args.num_iters,
@@ -626,7 +644,7 @@ def main():
                 + "{}_task{}_{}classes_{}_{}_it{}_order_{}.pth".format(
                     args.model_name,
                     task_id + 1,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     args.num_iters,
@@ -637,23 +655,56 @@ def main():
             train_loader, test_loader = get_loaders(
                 train_dataset[task_id], test_dataset[task_id], args.batch_size
             )
+            # class_counts = {}
+            # for _, labels in train_loader:
+            #     for label in labels:
+            #         label = label.item()
+            #         if label not in class_counts:
+            #             class_counts[label] = 0
+            #         class_counts[label] += 1
+            #     print("各クラスのデータ数:")
+            #     for label, count in class_counts.items():
+            #         print(f"クラス {label}: {count} 個")
 
             net.set_trainable_masks(task_id)
 
-            # タスクに対してネットワークを訓練
             net = train(
                 args=args,
                 model=net,
                 train_loader=train_loader,
                 test_loader=test_loader,
+                prototype_vectors=prototype_vectors,
                 device=device,
                 task_id=task_id,
             )
 
+            # prototype update
             net.eval()
-            # 精度を計算
-            acc = accuracy(net, test_loader, device)
+            set_task(net, task_id)
+            with torch.no_grad():
+                prototype_vectors = update_prototype_vector(
+                    train_loader, prototype_vectors, net, device=device
+                )
+
+            acc = accuracy(net, test_loader, prototype_vectors, device)
             print("Accuracy: ", np.round(100 * acc, 2))
+
+            data_iterator = iter(test_loader)
+            x, y = next(data_iterator)
+            x = x.to(device)
+            print("y: ", y[0])
+
+            for class_, prototype_vector in prototype_vectors.items():
+                # print("After training before pruning\n")
+                # print("pv", class_, prototype_vector)
+
+                set_task(net, net.class_task_map[class_])
+
+                feature = net.features(x)
+                # print("fv", y[0], feature[0])
+
+            with open("prototype.pickle", "wb") as f:
+                pickle.dump(prototype_vectors, f)
 
             random.seed(args.seed)
             np.random.seed(args.seed)
@@ -667,11 +718,13 @@ def main():
             x_prune = x_prune.permute(0, 3, 1, 2)
             x_prune = torchvision.transforms.Normalize(mean, std)(x_prune.float() / 255)
 
+            set_task(net, task_id)
             net = iterative_pruning(
                 args=args,
                 net=net,
                 train_loader=train_loader,
                 test_loader=test_loader,
+                prototype_vectors=prototype_vectors,
                 x_prune=x_prune,
                 task_id=task_id,
                 device=device,
@@ -687,7 +740,7 @@ def main():
                 + "{}_task{}_masks_{}classes_{}_{}_it{}_order_{}.pth".format(
                     args.model_name,
                     task_id + 1,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     args.num_iters,
@@ -708,11 +761,12 @@ def main():
         if not TRAIN:
             path_to_save = (
                 path_results
-                + "{}_{}task{}_{}classes_{}_{}_it{}_order_{}.pth".format(
+                + "{}_task{}_{}classes_{}_{}_it{}_order_{}.pth".format(
                     args.dataset_name,
                     args.model_name,
+                    args.model_name,
                     args.num_tasks,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     args.num_iters,
@@ -723,11 +777,12 @@ def main():
 
             net._load_masks(
                 file_name=path_results
-                + "{}_{}task{}_masks_{}classes_{}_{}_it{}_order_{}.pth".format(
+                + "{}_task{}_masks_{}classes_{}_{}_it{}_order_{}.pth".format(
                     args.dataset_name,
                     args.model_name,
+                    args.model_name,
                     args.num_tasks,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     args.num_iters,
@@ -748,7 +803,9 @@ def main():
                 train_dataset[task_id], test_dataset[task_id], args.batch_size
             )
 
-            accs1.append(np.round(100 * accuracy(net, test_loader, device), 2))
+            accs1.append(
+                np.round(100 * accuracy(net, test_loader, prototype_vectors, device), 2)
+            )
 
             print("Task {} accuracy with task_id: ".format(task_id + 1), accs1[task_id])
 
@@ -776,6 +833,7 @@ def main():
                     net,
                     train_dataset,
                     test_dataset,
+                    prototype_vectors,
                     path_to_save,
                     device,
                     method=method,
@@ -803,8 +861,10 @@ def main():
                 + "{}_{}_{}tasks_{}classes_{}_{}_avg_acc_{}_bs{}_order_{}.pickle".format(
                     args.dataset_name,
                     args.model_name,
+                    args.dataset_name,
+                    args.model_name,
                     args.num_tasks,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     method,
@@ -822,8 +882,10 @@ def main():
                 + "{}_{}_{}tasks_{}classes_{}_{}_task_select_{}_bs{}_order_{}.pickle".format(
                     args.dataset_name,
                     args.model_name,
+                    args.dataset_name,
+                    args.model_name,
                     args.num_tasks,
-                    args.num_classes_per_task,
+                    args.num_classes_first_task,
                     args.optimizer,
                     args.alpha_conv,
                     method,

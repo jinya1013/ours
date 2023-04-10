@@ -1,16 +1,8 @@
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt  # type: ignore
+import pandas as pd  # type: ignore
 import torch
-import torch.nn.functional as F
-import torchvision
 
-from data import set_task
-from pruning import (
-    select_subnetwork,
-    select_subnetwork_maxoutput,
-    compute_importance_train,
-)
+from pruning import compute_importance_train
 
 
 def eval(
@@ -18,6 +10,7 @@ def eval(
     model,
     train_dataset,
     test_dataset,
+    prototype_vectors,
     path_to_save,
     device,
     method="IS",
@@ -35,8 +28,8 @@ def eval(
         importances_train, total_importances_train = compute_importance_train(
             model, train_dataset, device
         )
-    # elif method == "nme":
-    #     prototypes, _ = get_prototypes(model)
+    elif method == "nme":
+        prototypes, _ = get_prototypes(model)
 
     total_acc = []
     total_acc_matrix = np.zeros((max_num_learned, max_num_learned))
@@ -66,33 +59,26 @@ def eval(
             acc_task_classification = 0
             correct_preds = 0
             for x, y_true in test_loaders[task_id]:
+                # x_tmp = torchvision.transforms.RandomHorizontalFlip(p=1)(x)
 
-                x_tmp = torchvision.transforms.RandomHorizontalFlip(p=1)(x)
+                # x_tmp = torch.cat((x, x_tmp))
 
-                x_tmp = torch.cat((x, x_tmp))
+                # if method == 'IS':
+                #     j0 = select_subnetwork(model, x_tmp, importances_train[:num_learned], device)
+                # elif 'max' in method:
+                #     j0 = select_subnetwork_maxoutput(model, x_tmp, num_learned, device)
+                # elif method == 'nme':
+                #     j0 = select_subnetwork_icarl(model, x_tmp, prototypes, num_learned, device)
 
-                if method == "IS":
-                    j0 = select_subnetwork(
-                        model, x_tmp, importances_train[:num_learned], device
-                    )
-                elif "max" in method:
-                    j0 = select_subnetwork_maxoutput(model, x_tmp, num_learned, device)
-                # elif method == "nme":
-                #     j0 = select_subnetwork_icarl(
-                #         model, x_tmp, prototypes, num_learned, device
-                #     )
+                # del x_tmp
 
-                del x_tmp
+                # if j0 == task_id:
+                acc_task_classification += x.size(0)
 
-                if j0 == task_id:
-                    acc_task_classification += x.size(0)
+                # set_task(model, j0)
 
-                    set_task(model, j0)
-
-                    pred = model(x.to(device))
-                    correct_preds += (
-                        (pred.argmax(dim=1) == y_true.to(device)).sum().float()
-                    )
+                y_pred = model.predict(x.to(device), prototype_vectors)
+                correct_preds += (y_pred == y_true.to(device)).sum().float()
 
             total_correct_preds += correct_preds
             acc_task_classification /= dataset_size
@@ -110,3 +96,13 @@ def eval(
     print(f"Accuracy : {100*acc.item():.2f}%")
 
     return total_acc, task_acc_matrix, total_acc_matrix
+
+
+def backward_transfer(acc_matrix, tasks_learned):
+    bwt = np.zeros(tasks_learned)
+
+    for t in range(1, tasks_learned):
+        for task_id in range(t):
+            bwt[t] += 100 * (acc_matrix[task_id, t] - acc_matrix[task_id, task_id]) / t
+
+    return list(-np.round(bwt, 2))
